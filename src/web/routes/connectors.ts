@@ -27,23 +27,41 @@ import type { RouteContext } from './types.js'
 // never lands in git and other users don't inherit it. Entries from the local
 // file override committed ones with the same id. A broken local file is
 // non-fatal (logged + ignored) so it can't take down the whole catalog.
+function localCatalogPath(): string {
+  return join(PROJECT_ROOT, 'mcp-catalog.local.json')
+}
+
+function readLocalCatalog(): any[] {
+  const localPath = localCatalogPath()
+  if (!existsSync(localPath)) return []
+  try {
+    const parsed = JSON.parse(readFileSync(localPath, 'utf-8'))
+    if (Array.isArray(parsed)) return parsed
+    logger.warn({ localPath }, 'mcp-catalog.local.json is not a JSON array, ignoring')
+  } catch (err) {
+    logger.error({ err }, 'Failed to parse mcp-catalog.local.json, ignoring')
+  }
+  return []
+}
+
 function loadMcpCatalog(): any[] {
   const central = JSON.parse(readFileSync(join(PROJECT_ROOT, 'mcp-catalog.json'), 'utf-8')) as any[]
-  let local: any[] = []
-  const localPath = join(PROJECT_ROOT, 'mcp-catalog.local.json')
-  if (existsSync(localPath)) {
-    try {
-      const parsed = JSON.parse(readFileSync(localPath, 'utf-8'))
-      if (Array.isArray(parsed)) local = parsed
-      else logger.warn({ localPath }, 'mcp-catalog.local.json is not a JSON array, ignoring')
-    } catch (err) {
-      logger.error({ err }, 'Failed to parse mcp-catalog.local.json, ignoring')
-    }
-  }
   const byId = new Map<string, any>()
   for (const item of central) byId.set(String(item.id), item)
-  for (const item of local) byId.set(String(item.id), item)
+  for (const item of readLocalCatalog()) byId.set(String(item.id), item)
   return [...byId.values()]
+}
+
+// Persist a user-installed MCP into the gitignored local catalog so it shows up
+// in the dashboard catalog as a user-local entry (and can be re-installed). Env
+// values are stored blank -- only the variable names are kept, mirroring the
+// committed catalog -- so secrets never land in this file. Upserts by id.
+function upsertLocalCatalogEntry(entry: any): void {
+  const local = readLocalCatalog()
+  const idx = local.findIndex(e => String(e.id) === String(entry.id))
+  if (idx >= 0) local[idx] = { ...local[idx], ...entry }
+  else local.push(entry)
+  atomicWriteFileSync(localCatalogPath(), JSON.stringify(local, null, 2) + '\n')
 }
 
 export async function tryHandleConnectors(ctx: RouteContext): Promise<boolean> {
@@ -334,16 +352,41 @@ export async function tryHandleConnectors(ctx: RouteContext): Promise<boolean> {
     try {
       const scopeFlag = data.scope === 'project' ? '-s project' : '-s user'
 
+      const catalogEntry: any = {
+        id: sanitizedName,
+        name: rawName,
+        description: 'Felhasználó által telepített MCP',
+        category: 'custom',
+        icon: '🔌',
+        authType: data.env && Object.keys(data.env).length ? 'apikey' : 'none',
+      }
+
       if ((data.type === 'http' || data.type === 'sse') && data.url) {
         const transport = data.type === 'sse' ? 'sse' : 'http'
         execSync(`claude mcp add --transport ${transport} ${scopeFlag} ${shellEscape(sanitizedName)} ${shellEscape(data.url)} 2>&1`, { timeout: 15000, encoding: 'utf-8' })
+        catalogEntry.type = 'remote'
+        catalogEntry.url = data.url
+        catalogEntry.transport = transport
       } else if (data.type === 'stdio' && data.command) {
         const envFlags = data.env ? Object.entries(data.env).map(([k, v]) => `-e ${shellEscape(k)}=${shellEscape(v)}`).join(' ') : ''
         const argsStr = data.args ? data.args.split(/\s+/).filter(Boolean).map(a => shellEscape(a)).join(' ') : ''
         execSync(`claude mcp add ${scopeFlag} ${shellEscape(sanitizedName)} ${envFlags} -- ${shellEscape(data.command)} ${argsStr} 2>&1`, { timeout: 15000, encoding: 'utf-8' })
+        catalogEntry.type = 'local'
+        catalogEntry.command = data.command
+        catalogEntry.args = data.args ? data.args.split(/\s+/).filter(Boolean) : []
+        // Store only env var names with blank values -- never the secrets.
+        catalogEntry.env = Object.fromEntries(Object.keys(data.env || {}).map(k => [k, '']))
       } else {
         json(res, { error: 'URL (http/sse) or command (stdio) required' }, 400)
         return true
+      }
+
+      try {
+        upsertLocalCatalogEntry(catalogEntry)
+      } catch (err) {
+        // The MCP is already installed via `claude mcp add`; a catalog-write
+        // failure shouldn't fail the request -- just log and move on.
+        logger.error({ err }, 'Failed to persist MCP into mcp-catalog.local.json')
       }
 
       json(res, { ok: true, name: sanitizedName, nameChanged })
