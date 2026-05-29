@@ -21,6 +21,31 @@ import {
 } from '../vault-bindings.js'
 import type { RouteContext } from './types.js'
 
+// The catalog is the union of the committed mcp-catalog.json (the MCPs the
+// central devs ship) and an optional, gitignored mcp-catalog.local.json where
+// a user keeps their own dev-only MCPs. This way a user's private MCP list
+// never lands in git and other users don't inherit it. Entries from the local
+// file override committed ones with the same id. A broken local file is
+// non-fatal (logged + ignored) so it can't take down the whole catalog.
+function loadMcpCatalog(): any[] {
+  const central = JSON.parse(readFileSync(join(PROJECT_ROOT, 'mcp-catalog.json'), 'utf-8')) as any[]
+  let local: any[] = []
+  const localPath = join(PROJECT_ROOT, 'mcp-catalog.local.json')
+  if (existsSync(localPath)) {
+    try {
+      const parsed = JSON.parse(readFileSync(localPath, 'utf-8'))
+      if (Array.isArray(parsed)) local = parsed
+      else logger.warn({ localPath }, 'mcp-catalog.local.json is not a JSON array, ignoring')
+    } catch (err) {
+      logger.error({ err }, 'Failed to parse mcp-catalog.local.json, ignoring')
+    }
+  }
+  const byId = new Map<string, any>()
+  for (const item of central) byId.set(String(item.id), item)
+  for (const item of local) byId.set(String(item.id), item)
+  return [...byId.values()]
+}
+
 export async function tryHandleConnectors(ctx: RouteContext): Promise<boolean> {
   const { req, res, path, method } = ctx
 
@@ -446,8 +471,7 @@ export async function tryHandleConnectors(ctx: RouteContext): Promise<boolean> {
   // === MCP Catalog ===
   if (path === '/api/mcp-catalog' && method === 'GET') {
     try {
-      const catalogPath = join(PROJECT_ROOT, 'mcp-catalog.json')
-      const catalog = JSON.parse(readFileSync(catalogPath, 'utf-8')) as any[]
+      const catalog = loadMcpCatalog()
 
       const installedSource = new Map<string, McpListEntry['source']>()
       for (const entry of getMcpListCache().entries) {
@@ -479,8 +503,7 @@ export async function tryHandleConnectors(ctx: RouteContext): Promise<boolean> {
   if (catalogInstallMatch && method === 'POST') {
     const id = decodeURIComponent(catalogInstallMatch[1])
     try {
-      const catalogPath = join(PROJECT_ROOT, 'mcp-catalog.json')
-      const catalog = JSON.parse(readFileSync(catalogPath, 'utf-8')) as any[]
+      const catalog = loadMcpCatalog()
       const item = catalog.find(c => c.id === id)
       if (!item) { json(res, { error: 'Item not found in catalog' }, 404); return true }
 
@@ -526,8 +549,7 @@ export async function tryHandleConnectors(ctx: RouteContext): Promise<boolean> {
   if (catalogUninstallMatch && method === 'DELETE') {
     const id = decodeURIComponent(catalogUninstallMatch[1])
     try {
-      const catalogPath = join(PROJECT_ROOT, 'mcp-catalog.json')
-      const catalog = JSON.parse(readFileSync(catalogPath, 'utf-8')) as any[]
+      const catalog = loadMcpCatalog()
       const item = catalog.find(c => c.id === id)
       if (!item) { json(res, { error: 'Item not found in catalog' }, 404); return true }
 
